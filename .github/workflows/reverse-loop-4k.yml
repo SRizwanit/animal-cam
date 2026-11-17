@@ -1,0 +1,634 @@
+name: 🎬 Reverse Loop Video 4K + Thumbnail
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  কাজ:
+#   1. repo এর  video/  ফোল্ডার থেকে আপনার দেওয়া ফাইল নেয়
+#   2. মূল ভিডিও → রিভার্স → মূল ভিডিও → রিভার্স ... (লুপ) — টার্গেট সময় (ডিফল্ট ২.৫ মিনিট) পর্যন্ত
+#   3. 4K (ল্যান্ডস্কেপ 3840x2160 / পোর্ট্রেট 2160x3840) এ এনকোড করে
+#   4. "Day {number}" লেখা Thumbnail বানায় — লেখা যেন চেহারা/সাবজেক্টের উপর না বসে
+#      সেজন্য Face detection + Saliency map + জায়গা মাপার (measure) পদ্ধতি ব্যবহার করে
+#   5. Thumbnail ভিডিওর ভেতরে cover হিসেবেও বসায়
+#   6. Artifact (এবং চাইলে GitHub Release) এ আউটপুট দেয়
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_name:
+        description: "video/ ফোল্ডারের ভিডিওর ফাইল নেইম (যেমন: Day01.mp4)"
+        required: true
+        default: "Day01.mp4"
+        type: string
+      day_number:
+        description: "Thumbnail এ বসবে: Day {number} (যেমন: 01 অথবা 1)"
+        required: true
+        default: "01"
+        type: string
+      duration_sec:
+        description: "ফাইনাল ভিডিওর দৈর্ঘ্য সেকেন্ডে (২.৫ মিনিট = 150)"
+        required: true
+        default: "150"
+        type: string
+      quality:
+        description: "4K কোয়ালিটি লেভেল"
+        required: true
+        default: "balanced"
+        type: choice
+        options:
+          - balanced   # CRF 16 · medium  (সেরা ব্যালেন্স)
+          - max        # CRF 12 · slow    (সর্বোচ্চ কোয়ালিটি, ধীর)
+          - fast       # CRF 20 · veryfast (দ্রুত)
+      audio_mode:
+        description: "অডিও কেমন হবে"
+        required: true
+        default: "reverse_sync"
+        type: choice
+        options:
+          - reverse_sync   # ভিডিওর সাথে অডিওও রিভার্স হবে
+          - mute           # অডিও থাকবে না
+      text_position:
+        description: "Thumbnail এ লেখার পজিশন (auto = সবচেয়ে ফাঁকা জায়গা নিজে খুঁজে নেবে)"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - top
+          - bottom
+          - top-left
+          - top-right
+          - bottom-left
+          - bottom-right
+      thumb_time:
+        description: "Thumbnail এর ফ্রেম (সেকেন্ড, যেমন 3.5) — auto = ৮টি ফ্রেম টেস্ট করে সেরাটা নেবে"
+        required: true
+        default: "auto"
+        type: string
+      publish_release:
+        description: "GitHub Release এও আপলোড করবে? (বড় ফাইল শেয়ার করতে সুবিধা)"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: reverse-loop-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build 4K reverse loop
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      VIDEO_NAME: ${{ inputs.video_name }}
+      DAY_TEXT: ${{ inputs.day_number }}
+      TARGET: ${{ inputs.duration_sec }}
+      QUALITY: ${{ inputs.quality }}
+      AUDIO_MODE: ${{ inputs.audio_mode }}
+      TEXT_POSITION: ${{ inputs.text_position }}
+      THUMB_TIME: ${{ inputs.thumb_time }}
+
+    steps:
+      # ───────────────────────── 1. Checkout ─────────────────────────
+      - name: 📥 Checkout repo
+        uses: actions/checkout@v4
+
+      # ───────────────────────── 2. Tools ─────────────────────────
+      - name: 🔧 Install FFmpeg, fonts, Python libs
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg fonts-dejavu-core fonts-liberation
+          python3 -m pip install --upgrade pip
+          python3 -m pip install numpy pillow opencv-contrib-python-headless
+          ffmpeg -version | head -n 1
+          python3 -c "import cv2; print('OpenCV', cv2.__version__)"
+
+      # ───────────────────────── 3. Validate + Probe ─────────────────────────
+      - name: 🔍 Validate input & probe video
+        run: |
+          set -euo pipefail
+          mkdir -p work output
+
+          # ---- ইনপুট যাচাই ----
+          case "$VIDEO_NAME" in
+            ""|*/*|*..*) echo "::error::ভুল ফাইল নেইম। শুধু ফাইলের নাম দিন (যেমন Day01.mp4), পাথ নয়।"; exit 1;;
+          esac
+          if ! [[ "$TARGET" =~ ^[0-9]+([.][0-9]+)?$ ]] || [ "$(awk -v t="$TARGET" 'BEGIN{print (t>=1)?1:0}')" != "1" ]; then
+            echo "::error::duration_sec অবশ্যই সংখ্যা হতে হবে (যেমন 150)"; exit 1
+          fi
+          if ! [[ "$DAY_TEXT" =~ ^[A-Za-z0-9_-]{1,10}$ ]]; then
+            echo "::error::day_number এ শুধু ইংরেজি অক্ষর/সংখ্যা (১-১০ অক্ষর) দিন, যেমন 01"; exit 1
+          fi
+          if [ "$THUMB_TIME" != "auto" ] && ! [[ "$THUMB_TIME" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            echo "::error::thumb_time হয় auto, নয়তো সেকেন্ড (যেমন 3.5)"; exit 1
+          fi
+
+          # ---- ফাইল খোঁজা (এক্সটেনশন না দিলেও চলবে) ----
+          SRC="video/$VIDEO_NAME"
+          if [ ! -f "$SRC" ]; then
+            for ext in mp4 mov mkv webm m4v; do
+              if [ -f "video/$VIDEO_NAME.$ext" ]; then SRC="video/$VIDEO_NAME.$ext"; break; fi
+            done
+          fi
+          if [ ! -f "$SRC" ]; then
+            echo "::error::video/ ফোল্ডারে '$VIDEO_NAME' পাওয়া যায়নি। বর্তমানে আছে:"
+            ls -la video/ || echo "(video/ ফোল্ডারই নেই)"
+            exit 1
+          fi
+          STEM="$(basename "${SRC%.*}" | tr -c 'A-Za-z0-9_.-\n' '_')"
+
+          # ---- প্রপার্টি ----
+          read -r W H FPS_FRAC < <(ffprobe -v error -select_streams v:0 \
+              -show_entries stream=width,height,r_frame_rate -of csv=p=0:s=' ' "$SRC")
+          ROT="$( (ffprobe -v error -select_streams v:0 -show_entries stream_side_data=rotation \
+              -of default=nw=1:nk=1 "$SRC" | head -n1 | tr -d '-' | cut -d. -f1) || true )"
+          if [ "$ROT" = "90" ] || [ "$ROT" = "270" ]; then T="$W"; W="$H"; H="$T"; fi
+          FPS="$(awk -F/ '{ if ($2>0) printf "%.4f",$1/$2; else print 30 }' <<<"$FPS_FRAC")"
+          if [ "$FPS_FRAC" = "0/0" ]; then FPS_FRAC="30/1"; fi
+          DUR="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$SRC")"
+          if [ "$(awk -v d="$DUR" 'BEGIN{print (d>=0.5)?1:0}')" != "1" ]; then
+            echo "::error::ভিডিও খুব ছোট বা পড়া যাচ্ছে না (duration=$DUR)"; exit 1
+          fi
+
+          HAS_AUDIO=0
+          if [ -n "$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of csv=p=0 "$SRC")" ] \
+             && [ "$AUDIO_MODE" != "mute" ]; then HAS_AUDIO=1; fi
+
+          # ---- 4K টার্গেট (ওরিয়েন্টেশন অনুযায়ী) ----
+          if [ "$H" -gt "$W" ]; then TW=2160; TH=3840; else TW=3840; TH=2160; fi
+          MATCH="$(awk -v w="$W" -v h="$H" -v tw="$TW" -v th="$TH" \
+                   'BEGIN{d=w/h-tw/th; if(d<0)d=-d; print (d<0.01)?1:0}')"
+
+          if [ "$MATCH" = "1" ]; then
+            VF="scale=${TW}:${TH}:flags=lanczos,setsar=1,format=yuv420p"
+          else
+            # অ্যাসপেক্ট রেশিও না মিললে: ঝাপসা ব্যাকগ্রাউন্ড + মাঝখানে পুরো ভিডিও (কিছু কাটা পড়বে না)
+            VF="split=2[a][b];[a]scale=${TW}:${TH}:force_original_aspect_ratio=increase,crop=${TW}:${TH},boxblur=50:6[bg];[b]scale=${TW}:${TH}:force_original_aspect_ratio=decrease:flags=lanczos[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,format=yuv420p"
+          fi
+          printf '%s' "$VF" > work/vf.txt
+
+          {
+            echo "SRC=$SRC"; echo "STEM=$STEM"; echo "W=$W"; echo "H=$H"
+            echo "FPS_FRAC=$FPS_FRAC"; echo "FPS=$FPS"; echo "DUR=$DUR"
+            echo "HAS_AUDIO=$HAS_AUDIO"; echo "TW=$TW"; echo "TH=$TH"
+          } >> "$GITHUB_ENV"
+
+          echo "📄 ফাইল: $SRC | ${W}x${H} @ ${FPS}fps | ${DUR}s | audio=$HAS_AUDIO"
+          echo "🎯 আউটপুট: ${TW}x${TH} | aspect-match=$MATCH | টার্গেট=${TARGET}s"
+
+      # ───────────────────────── 4. Loop segments ─────────────────────────
+      - name: 🔁 Build forward / reverse segments
+        run: |
+          set -euo pipefail
+          cd work
+
+          # ভেতরের (intermediate) ফাইল অরিজিনাল রেজোলিউশনে, প্রায়-লসলেস — শেষে একবারই 4K এনকোড হবে
+          VENC=(-c:v libx264 -preset veryfast -crf 12 -pix_fmt yuv420p)
+          if [ "$HAS_AUDIO" = "1" ]; then AENC=(-c:a pcm_s16le -ar 48000 -ac 2); else AENC=(-an); fi
+          FF=(ffmpeg -hide_banner -loglevel error -y)
+
+          # 1) base: ঠিক fps এ নরমালাইজ
+          "${FF[@]}" -i "../$SRC" -vf "fps=${FPS_FRAC},setpts=PTS-STARTPTS" -map 0:v:0 \
+              $( [ "$HAS_AUDIO" = "1" ] && echo "-map 0:a:0" ) "${VENC[@]}" "${AENC[@]}" base.mkv
+
+          NF="$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 base.mkv)"
+          FULL="$(awk -v n="$NF" -v f="$FPS" 'BEGIN{printf "%.6f", n/f}')"
+          FD="$(awk -v f="$FPS" 'BEGIN{printf "%.6f", 1/f}')"
+          echo "ফ্রেম=$NF | সেগমেন্ট দৈর্ঘ্য=${FULL}s | ১ ফ্রেম=${FD}s"
+
+          # 2) fwd_full: অডিও ঠিক ভিডিওর সমান দৈর্ঘ্যে (sync drift ঠেকাতে)
+          if [ "$HAS_AUDIO" = "1" ]; then
+            AF_FULL=(-af "apad=whole_dur=${FULL},atrim=end=${FULL},asetpts=PTS-STARTPTS")
+          else AF_FULL=(); fi
+          "${FF[@]}" -i base.mkv "${AF_FULL[@]}" "${VENC[@]}" "${AENC[@]}" fwd_full.mkv
+
+          # 3) রিভার্স (RAM এর হিসাব করে বড় ভিডিও হলে টুকরো টুকরো করে রিভার্স)
+          MAXF="$(awk -v w="$W" -v h="$H" 'BEGIN{printf "%d", 1.5e9/(w*h*1.5)}')"
+          if [ "$HAS_AUDIO" = "1" ]; then AF_REV=(-af areverse); else AF_REV=(); fi
+          if [ "$NF" -le "$MAXF" ]; then
+            echo "↩️ সরাসরি রিভার্স ($NF ফ্রেম ≤ $MAXF)"
+            "${FF[@]}" -i fwd_full.mkv -vf reverse "${AF_REV[@]}" "${VENC[@]}" "${AENC[@]}" rev_full.mkv
+          else
+            CHUNK="$(awk -v m="$MAXF" -v f="$FPS" 'BEGIN{c=int(m/f); if(c<2)c=2; print c}')"
+            echo "↩️ বড় ভিডিও — ${CHUNK}s এর টুকরোয় রিভার্স"
+            rm -rf chunks && mkdir chunks
+            "${FF[@]}" -i fwd_full.mkv "${VENC[@]}" "${AENC[@]}" \
+                -force_key_frames "expr:gte(t,n_forced*${CHUNK})" \
+                -f segment -segment_time "$CHUNK" -reset_timestamps 1 chunks/c_%04d.mkv
+            : > rev_list.txt
+            for c in $(ls chunks/c_*.mkv | sort -r); do
+              r="chunks/rev_$(basename "$c")"
+              "${FF[@]}" -i "$c" -vf reverse "${AF_REV[@]}" "${VENC[@]}" "${AENC[@]}" "$r"
+              echo "file '$r'" >> rev_list.txt
+            done
+            "${FF[@]}" -f concat -safe 0 -i rev_list.txt -c copy rev_full.mkv
+          fi
+
+          # 4) জোড়ার ফ্রেম ডুপ্লিকেট এড়াতে: যেখানে আগের সেগমেন্টের শেষ ফ্রেমই পরেরটার প্রথম ফ্রেম,
+          #    সেই ১টি ফ্রেম বাদ দিয়ে দিই — তাই জোড়ায় কোনো থেমে যাওয়া/ঝাঁকুনি হবে না
+          if [ "$HAS_AUDIO" = "1" ]; then
+            AF_TRIM=(-af "apad=whole_dur=${FULL},atrim=start=${FD}:end=${FULL},asetpts=PTS-STARTPTS")
+          else AF_TRIM=(); fi
+          for pair in "rev_full:rev_trim" "fwd_full:fwd_trim"; do
+            in="${pair%%:*}"; out="${pair##*:}"
+            "${FF[@]}" -i "$in.mkv" -vf "trim=start_frame=1,setpts=PTS-STARTPTS" "${AF_TRIM[@]}" \
+                "${VENC[@]}" "${AENC[@]}" "$out.mkv"
+          done
+
+          # 5) concat লিস্ট: মূল → রিভার্স → মূল → রিভার্স ...
+          TRIMLEN="$(awk -v f="$FULL" -v d="$FD" 'BEGIN{printf "%.6f", f-d}')"
+          SEGS="$(awk -v t="$TARGET" -v f="$FULL" -v tl="$TRIMLEN" 'BEGIN{n=1; acc=f; while(acc<t){n++; acc+=tl}; print n}')"
+          echo "file 'fwd_full.mkv'" > list.txt
+          for ((i=1; i<SEGS; i++)); do
+            if (( i % 2 == 1 )); then echo "file 'rev_trim.mkv'"; else echo "file 'fwd_trim.mkv'"; fi
+          done >> list.txt
+          echo "মোট সেগমেন্ট: $SEGS (মূল→রিভার্স→মূল→রিভার্স...)"
+          echo "FULL=$FULL" >> "$GITHUB_ENV"
+
+      # ───────────────────────── 5. Smart Thumbnail ─────────────────────────
+      - name: 🖼️ Extract candidate frames
+        run: |
+          set -euo pipefail
+          VF="$(cat work/vf.txt)"
+          rm -rf work/frames && mkdir -p work/frames
+          if [ "$THUMB_TIME" = "auto" ]; then
+            for p in 12 22 32 42 52 62 72 82; do
+              t="$(awk -v d="$DUR" -v p="$p" 'BEGIN{printf "%.3f", d*p/100}')"
+              ffmpeg -hide_banner -loglevel error -y -ss "$t" -i "$SRC" -frames:v 1 -vf "$VF" "work/frames/f_${p}.png"
+            done
+          else
+            t="$(awk -v d="$DUR" -v t="$THUMB_TIME" 'BEGIN{if(t>d-0.1)t=d-0.1; if(t<0)t=0; printf "%.3f", t}')"
+            ffmpeg -hide_banner -loglevel error -y -ss "$t" -i "$SRC" -frames:v 1 -vf "$VF" "work/frames/f_manual.png"
+          fi
+          ls -la work/frames
+
+      - name: 🧠 Measure free space & render "Day N" thumbnail
+        env:
+          FRAME_DIR: work/frames
+          OUT_DIR: output
+        run: |
+          set -euo pipefail
+          cat > work/thumb.py <<'PY'
+          #!/usr/bin/env python3
+          """
+          Day-লেখা Thumbnail জেনারেটর — লেখা কখনো চেহারা/সাবজেক্টের উপর বসবে না।
+
+          পদ্ধতি (সংক্ষেপে):
+            1. Face detection (Haar: human frontal/profile + cat-face, উল্টানো ফ্রেমসহ)
+            2. Saliency (spectral residual) + Edge-density => "সাবজেক্ট ম্যাপ"
+            3. লেখার আসল মাপ PIL দিয়ে মাপা হয় (stroke + padding সহ) — ফন্ট সাইজ ধাপে ধাপে ছোট করা হয়
+            4. ৯টি পজিশন x ৬টি সাইজ = ৫৪টি সম্ভাব্য বক্স; প্রতিটির জন্য
+               (সাবজেক্ট overlap + face overlap + Reels/Shorts/YouTube UI zone + সাইজ-পেনাল্টি) স্কোর
+            5. সর্বনিম্ন স্কোরের বক্স নির্বাচন; auto মোডে ৮টি ফ্রেমের মধ্যে সেরাটি
+            6. নিচের জায়গার brightness দেখে লেখার রঙ ঠিক করা (সাদা/কালো + stroke + shadow)
+          """
+          import os, sys, json, glob, math
+          import numpy as np
+          import cv2
+          from PIL import Image, ImageDraw, ImageFont, ImageFilter
+
+          FRAME_DIR = os.environ["FRAME_DIR"]
+          OUT_DIR = os.environ["OUT_DIR"]
+          STEM = os.environ["STEM"]
+          DAY = os.environ["DAY_TEXT"].strip()
+          POSITION = os.environ.get("TEXT_POSITION", "auto").strip()
+          TEXT = f"Day {DAY}"
+          os.makedirs(OUT_DIR, exist_ok=True)
+
+          FONT_CANDIDATES = [
+              "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+              "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+              "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+          ]
+          FONT = next((p for p in FONT_CANDIDATES if os.path.exists(p)), None)
+          if FONT is None:
+              sys.exit("Bold font পাওয়া যায়নি")
+
+          _probe = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+          PAD_K = 0.22  # লেখার চারপাশের নিরাপদ ফাঁক (ফন্ট সাইজের অনুপাতে)
+
+
+          def measure(px):
+              """লেখার আসল bbox মাপা (stroke সহ)"""
+              px = max(8, int(px))
+              sw = max(2, int(round(px * 0.08)))
+              f = ImageFont.truetype(FONT, px)
+              b = _probe.textbbox((0, 0), TEXT, font=f, stroke_width=sw)
+              return f, sw, b
+
+
+          def norm(a):
+              a = a.astype(np.float32)
+              return (a - a.min()) / (a.max() - a.min() + 1e-6)
+
+
+          def analyse(img):
+              W, H = img.size
+              s = 1000.0 / max(W, H)
+              aw, ah = max(16, int(W * s)), max(16, int(H * s))
+              small = cv2.cvtColor(np.array(img.resize((aw, ah), Image.LANCZOS)), cv2.COLOR_RGB2BGR)
+              gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+              # --- saliency ---
+              sal = None
+              try:
+                  sp = cv2.saliency.StaticSaliencySpectralResidual_create()
+                  ok, m = sp.computeSaliency(small)
+                  if ok:
+                      sal = norm(cv2.GaussianBlur(m.astype(np.float32), (0, 0), aw * 0.012))
+              except Exception as e:  # noqa
+                  print("saliency unavailable:", e)
+
+              # --- edge density ---
+              gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+              gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+              edge = norm(cv2.GaussianBlur(cv2.magnitude(gx, gy), (0, 0), aw * 0.012))
+
+              S = edge if sal is None else norm(0.55 * sal + 0.45 * edge)
+              u8 = (S * 255).astype(np.uint8)
+              thr, _ = cv2.threshold(u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+              mask = (u8 > thr).astype(np.uint8)
+              k = max(3, int(min(aw, ah) * 0.03))
+              kern = np.ones((k, k), np.uint8)
+              mask = cv2.dilate(cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kern), kern)
+
+              # --- faces ---
+              eq = cv2.equalizeHist(gray)
+              minsz = max(12, int(min(aw, ah) * 0.04))
+              faces = []
+              for name in ("haarcascade_frontalface_default.xml", "haarcascade_frontalface_alt2.xml",
+                           "haarcascade_profileface.xml", "haarcascade_frontalcatface_extended.xml"):
+                  path = os.path.join(cv2.data.haarcascades, name)
+                  if not os.path.exists(path):
+                      continue
+                  cc = cv2.CascadeClassifier(path)
+                  for im, flip in ((eq, False), (cv2.flip(eq, 1), True)):
+                      for (x, y, w, h) in cc.detectMultiScale(im, 1.1, 5, minSize=(minsz, minsz)):
+                          if flip:
+                              x = aw - x - w
+                          faces.append((int(x), int(y), int(w), int(h)))
+              face_mask = np.zeros((ah, aw), np.float32)
+              for (x, y, w, h) in faces:  # মাথা/চুল/কান/কেশর ধরতে বক্স বড় করা
+                  cx, cy = x + w / 2, y + h / 2
+                  ew, eh = w * 1.7, h * 1.9
+                  x0, x1 = int(max(0, cx - ew / 2)), int(min(aw, cx + ew / 2))
+                  y0, y1 = int(max(0, cy - eh / 2)), int(min(ah, cy + eh / 2))
+                  face_mask[y0:y1, x0:x1] = 1.0
+
+              cost = (0.5 * S + 0.5 * mask).astype(np.float32)
+              sharp = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+              return {
+                  "s": s, "aw": aw, "ah": ah, "S": S, "mask": mask, "faces": faces,
+                  "face_mask": face_mask, "ii_cost": cv2.integral(cost),
+                  "ii_face": cv2.integral(face_mask), "sharp": sharp,
+              }
+
+
+          def rect_mean(ii, aw, ah, x0, y0, x1, y1):
+              x0, y0 = max(0, x0), max(0, y0)
+              x1, y1 = min(aw, x1), min(ah, y1)
+              if x1 <= x0 or y1 <= y0:
+                  return 0.0
+              tot = ii[y1, x1] - ii[y0, x1] - ii[y1, x0] + ii[y0, x0]
+              return float(tot / ((x1 - x0) * (y1 - y0)))
+
+
+          def inter_frac(r, zones):
+              x, y, w, h = r
+              area = w * h
+              inter = 0.0
+              for (zx0, zy0, zx1, zy1) in zones:
+                  ix = max(0.0, min(x + w, zx1) - max(x, zx0))
+                  iy = max(0.0, min(y + h, zy1) - max(y, zy0))
+                  inter += ix * iy
+              return min(1.0, inter / area)
+
+
+          def plan(img, A):
+              W, H = img.size
+              portrait = H > W
+              m = int(min(W, H) * 0.05)
+
+              # লেখা ফ্রেমের ৮৪% প্রস্থ ও ১২% উচ্চতার বেশি নেবে না — এটাই সর্বোচ্চ সাইজ
+              _, _, b = measure(200)
+              tw, th = (b[2] - b[0]) / 200.0, (b[3] - b[1]) / 200.0
+              base_px = min(W * 0.84 / (tw + 2 * PAD_K), H * 0.12 / (th + 2 * PAD_K))
+
+              if portrait:   # Reels / Shorts / TikTok UI এড়ানো
+                  unsafe = [(0, H * 0.78, W, H), (W * 0.86, H * 0.45, W, H * 0.78), (0, 0, W, H * 0.06)]
+              else:          # YouTube সময়ের ব্যাজ (নিচের ডান কোণ)
+                  unsafe = [(W * 0.80, H * 0.86, W, H)]
+
+              best = None
+              for sc in (1.0, 0.88, 0.76, 0.64, 0.52, 0.42):
+                  px = base_px * sc
+                  f, sw, b = measure(px)
+                  pad = PAD_K * px
+                  w = int(round((b[2] - b[0]) + 2 * pad))
+                  h = int(round((b[3] - b[1]) + 2 * pad))
+                  top_y = H * 0.07 if portrait else m
+                  bot_y = (H * 0.78 - h) if portrait else (H - m - h)
+                  cx = (W - w) / 2
+                  cands = {
+                      "top": (cx, top_y, 0.00),
+                      "upper": (cx, H * 0.17, 0.05),
+                      "lower": (cx, H * 0.60, 0.08),
+                      "bottom": (cx, bot_y, 0.10),
+                      "top-left": (m, top_y, 0.14),
+                      "top-right": (W - m - w, top_y, 0.14),
+                      "bottom-left": (m, bot_y, 0.18),
+                      "bottom-right": (W - m - w, bot_y, 0.22),
+                      "middle": (cx, (H - h) / 2, 0.35),
+                  }
+                  for name, (x, y, pref) in cands.items():
+                      if POSITION != "auto" and name != POSITION:
+                          continue
+                      x = int(min(max(x, 0), W - w))
+                      y = int(min(max(y, 0), H - h))
+                      s = A["s"]
+                      args = (A["aw"], A["ah"], int(x * s), int(y * s),
+                              int(math.ceil((x + w) * s)), int(math.ceil((y + h) * s)))
+                      cost = rect_mean(A["ii_cost"], *args)
+                      face = rect_mean(A["ii_face"], *args)
+                      unsafe_f = inter_frac((x, y, w, h), unsafe)
+                      score = (10 * cost + 200 * face + (50 if face > 0.002 else 0)
+                               + 3 * unsafe_f + (1 - sc) * 1.2 + pref)
+                      cand = {"name": name, "rect": (x, y, w, h), "px": px, "pad": pad, "scale": sc,
+                              "cost": cost, "face": face, "unsafe": unsafe_f, "score": score}
+                      if best is None or score < best["score"]:
+                          best = cand
+              return best
+
+
+          def render(img, P):
+              W, H = img.size
+              x, y, w, h = P["rect"]
+              f, sw, b = measure(P["px"])
+              region = np.array(img.crop((x, y, x + w, y + h)).convert("L"))
+              lum, busy = float(region.mean()), float(region.std())
+              panel_used = busy > 55 or P["cost"] > 0.30
+              if lum > 150 and not panel_used:
+                  fill, stroke = (22, 22, 22, 255), (255, 255, 255, 255)
+              else:
+                  fill, stroke = (255, 255, 255, 255), (10, 10, 10, 255)
+
+              base = img.convert("RGBA")
+              if panel_used:  # জায়গা ব্যস্ত হলে হালকা কালো প্যানেল — পড়তে সুবিধা
+                  panel = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+                  ImageDraw.Draw(panel).rounded_rectangle(
+                      (x, y, x + w, y + h), radius=int(P["pad"] * 0.9), fill=(0, 0, 0, 105))
+                  base = Image.alpha_composite(base, panel)
+
+              tx, ty = x + P["pad"] - b[0], y + P["pad"] - b[1]
+              off = max(2, int(P["px"] * 0.04))
+              shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+              ImageDraw.Draw(shadow).text((tx + off, ty + off), TEXT, font=f, fill=(0, 0, 0, 190),
+                                          stroke_width=sw, stroke_fill=(0, 0, 0, 190))
+              shadow = shadow.filter(ImageFilter.GaussianBlur(max(2, P["px"] * 0.035)))
+              base = Image.alpha_composite(base, shadow)
+              layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+              ImageDraw.Draw(layer).text((tx, ty), TEXT, font=f, fill=fill,
+                                         stroke_width=sw, stroke_fill=stroke)
+              return Image.alpha_composite(base, layer).convert("RGB"), {"lum": lum, "busy": busy, "panel": panel_used}
+
+
+          def save_jpg_under(img, path, limit=2_000_000):
+              q = 94
+              while q >= 55:
+                  img.save(path, "JPEG", quality=q, subsampling=0, optimize=True)
+                  if os.path.getsize(path) <= limit:
+                      return q
+                  q -= 4
+              return q
+
+
+          # ─────────── সব ফ্রেম পরীক্ষা, সেরাটা নির্বাচন ───────────
+          frames = sorted(glob.glob(os.path.join(FRAME_DIR, "*.png")))
+          if not frames:
+              sys.exit("কোনো ফ্রেম পাওয়া যায়নি")
+          results = []
+          for fp in frames:
+              img = Image.open(fp).convert("RGB")
+              A = analyse(img)
+              P = plan(img, A)
+              results.append((fp, img, A, P))
+              print(f"[{os.path.basename(fp)}] faces={len(A['faces'])} → {P['name']} "
+                    f"scale={P['scale']} cost={P['cost']:.3f} face={P['face']:.3f} score={P['score']:.3f}")
+          maxsharp = max(r[2]["sharp"] for r in results) or 1.0
+          fp, img, A, P = min(results, key=lambda r: r[3]["score"] - 0.4 * r[2]["sharp"] / maxsharp)
+          print(f"✅ নির্বাচিত ফ্রেম: {os.path.basename(fp)} | পজিশন: {P['name']} | ফন্ট: {int(P['px'])}px")
+
+          out, info = render(img, P)
+          p4k = os.path.join(OUT_DIR, f"{STEM}_Thumbnail_4K.jpg")
+          phd = os.path.join(OUT_DIR, f"{STEM}_Thumbnail_HD.jpg")
+          out.save(p4k, "JPEG", quality=95, subsampling=0, optimize=True)
+          W, H = out.size
+          k = 1920.0 / max(W, H)
+          hd = out.resize((int(W * k), int(H * k)), Image.LANCZOS)
+          q = save_jpg_under(hd, phd)
+
+          # ─────────── ডিবাগ ছবি: লাল = সাবজেক্ট, সবুজ = face, নীল বক্স = লেখার জায়গা ───────────
+          aw, ah = A["aw"], A["ah"]
+          dbg = np.array(img.resize((aw, ah), Image.LANCZOS)).astype(np.float32)
+          red = np.zeros_like(dbg); red[..., 0] = 255
+          m = A["mask"][..., None].astype(np.float32)
+          dbg = dbg * (1 - 0.35 * m) + red * 0.35 * m
+          dbg = Image.fromarray(dbg.astype(np.uint8))
+          d = ImageDraw.Draw(dbg)
+          for (fx, fy, fw, fh) in A["faces"]:
+              d.rectangle((fx, fy, fx + fw, fy + fh), outline=(0, 255, 0), width=3)
+          x, y, w, h = P["rect"]; s = A["s"]
+          d.rectangle((x * s, y * s, (x + w) * s, (y + h) * s), outline=(0, 120, 255), width=4)
+          dbg.save(os.path.join(OUT_DIR, f"{STEM}_Thumbnail_DEBUG.jpg"), quality=88)
+
+          report = {
+              "text": TEXT, "chosen_frame": os.path.basename(fp), "position": P["name"],
+              "font_px": int(P["px"]), "rect_xywh": list(map(int, P["rect"])),
+              "subject_overlap_cost": round(P["cost"], 4), "face_overlap": round(P["face"], 4),
+              "ui_unsafe_overlap": round(P["unsafe"], 4), "faces_found": len(A["faces"]),
+              "region_luminance": round(info["lum"], 1), "panel_used": info["panel"],
+              "hd_jpeg_quality": q, "size": [W, H],
+          }
+          with open(os.path.join(OUT_DIR, f"{STEM}_Thumbnail_REPORT.json"), "w", encoding="utf-8") as fh:
+              json.dump(report, fh, ensure_ascii=False, indent=2)
+          print(json.dumps(report, ensure_ascii=False, indent=2))
+          if P["face"] > 0.002:
+              print("::warning::লেখা পুরোপুরি face এড়াতে পারেনি — thumb_time/text_position বদলে আবার চেষ্টা করুন")
+          PY
+          python3 work/thumb.py
+
+      # ───────────────────────── 6. Final 4K encode ─────────────────────────
+      - name: 🎞️ Encode final 4K video
+        run: |
+          set -euo pipefail
+          VF="$(cat work/vf.txt)"
+          case "$QUALITY" in
+            max)  CRF=12; PRESET=slow;;
+            fast) CRF=20; PRESET=veryfast;;
+            *)    CRF=16; PRESET=medium;;
+          esac
+          if [ "$HAS_AUDIO" = "1" ]; then AOUT=(-c:a aac -b:a 192k -ar 48000 -ac 2); else AOUT=(-an); fi
+
+          echo "🎬 Encoding ${TW}x${TH} | CRF=$CRF | preset=$PRESET | ${TARGET}s"
+          ffmpeg -hide_banner -loglevel warning -stats -y \
+            -f concat -safe 0 -i work/list.txt \
+            -t "$TARGET" \
+            -vf "$VF" \
+            -c:v libx264 -preset "$PRESET" -crf "$CRF" -profile:v high -level 5.2 -pix_fmt yuv420p \
+            -colorspace bt709 -color_primaries bt709 -color_trc bt709 \
+            -r "$FPS_FRAC" "${AOUT[@]}" -movflags +faststart \
+            work/main.mp4
+
+          # Thumbnail কে ভিডিওর cover (attached picture) হিসেবে বসানো
+          ffmpeg -hide_banner -loglevel error -y \
+            -i work/main.mp4 -i "output/${STEM}_Thumbnail_HD.jpg" \
+            -map 0:v -map "0:a?" -map 1:v -c copy -disposition:v:1 attached_pic \
+            -movflags +faststart "output/${STEM}_Loop_4K.mp4"
+
+      # ───────────────────────── 7. Verify ─────────────────────────
+      - name: ✅ Verify output
+        run: |
+          set -euo pipefail
+          OUT="output/${STEM}_Loop_4K.mp4"
+          RW="$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$OUT")"
+          RH="$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$OUT")"
+          RD="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$OUT")"
+          SZ="$(du -h "$OUT" | cut -f1)"
+          echo "📦 $OUT → ${RW}x${RH} | ${RD}s | $SZ"
+          if [ "$RW" != "$TW" ] || [ "$RH" != "$TH" ]; then echo "::error::রেজোলিউশন মেলেনি"; exit 1; fi
+          if [ "$(awk -v a="$RD" -v b="$TARGET" 'BEGIN{d=a-b; if(d<0)d=-d; print (d<1.0)?1:0}')" != "1" ]; then
+            echo "::error::ভিডিওর দৈর্ঘ্য টার্গেটের সাথে মেলেনি ($RD vs $TARGET)"; exit 1
+          fi
+          {
+            echo "### 🎬 ${STEM} — Reverse Loop 4K"
+            echo "- আউটপুট: \`${RW}x${RH}\` · \`${RD}s\` · \`${SZ}\`"
+            echo "- Thumbnail: \`Day ${DAY_TEXT}\`"
+            echo '```json'; cat "output/${STEM}_Thumbnail_REPORT.json"; echo; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ───────────────────────── 8. Upload ─────────────────────────
+      - name: ⬆️ Upload artifact (video + thumbnails)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.STEM }}_Loop_4K_Day${{ inputs.day_number }}
+          path: output/
+          compression-level: 0
+          retention-days: 14
+
+      - name: 🚀 Publish GitHub Release (optional)
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: loop-${{ env.STEM }}-run${{ github.run_number }}
+          name: ${{ env.STEM }} · Reverse Loop 4K (Day ${{ inputs.day_number }})
+          body: |
+            🎬 ${{ env.STEM }} — মূল → রিভার্স → মূল ... লুপ, ${{ inputs.duration_sec }} সেকেন্ড, 4K
+            🖼️ Thumbnail: Day ${{ inputs.day_number }}
+          files: |
+            output/${{ env.STEM }}_Loop_4K.mp4
+            output/${{ env.STEM }}_Thumbnail_4K.jpg
+            output/${{ env.STEM }}_Thumbnail_HD.jpg
