@@ -1,0 +1,5 @@
+kit/remotion/node_modules/
+kit/remotion/public/*.mp4
+kit/remotion/public/*.jpg
+output/
+__pycache__/
