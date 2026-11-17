@@ -1,0 +1,174 @@
+name: 🎞️ Universal Video Kit (Python + React/Remotion)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  কাজ: video/ ফোল্ডারের ভিডিও → Python (FFmpeg + seed) → Remotion (React) → ইউনিক ৪K ভিডিও + থাম্বনেইল
+#  Actions ট্যাব → "Universal Video Kit" → Run workflow
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_name:
+        description: "video/ ফোল্ডারের ফাইল (যেমন Day01.mp4)"
+        required: true
+        default: "Day01.mp4"
+        type: string
+      day_number:
+        description: "Day নম্বর (যেমন 01)"
+        required: true
+        default: "01"
+        type: string
+      duration_sec:
+        description: "ফাইনাল দৈর্ঘ্য সেকেন্ডে (২.৫ মিনিট = 150)"
+        required: true
+        default: "150"
+        type: string
+      resolution:
+        description: "রেজোলিউশন"
+        required: true
+        default: "4k"
+        type: choice
+        options: [4k, 1080p, 720p]
+      quality:
+        description: "কোয়ালিটি"
+        required: true
+        default: "balanced"
+        type: choice
+        options: [balanced, max, fast]
+      audio_mode:
+        description: "অডিও"
+        required: true
+        default: "reverse_sync"
+        type: choice
+        options: [reverse_sync, mute]
+      brand_text:
+        description: "চ্যানেল/ব্র্যান্ড নাম (intro, badge, outro এ বসবে)"
+        required: true
+        default: "Animal Cam"
+        type: string
+      unique_salt:
+        description: "একই ভিডিও থেকে আরেকটি আলাদা ভার্সন চাইলে এটি বদলান (যেমন v2)"
+        required: false
+        default: ""
+        type: string
+      publish_release:
+        description: "GitHub Release এও আপলোড করবেন?"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: universal-video-kit-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build unique video
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      VIDEO_NAME: ${{ inputs.video_name }}
+      DAY_TEXT: ${{ inputs.day_number }}
+      TARGET: ${{ inputs.duration_sec }}
+      RESOLUTION: ${{ inputs.resolution }}
+      QUALITY: ${{ inputs.quality }}
+      AUDIO_MODE: ${{ inputs.audio_mode }}
+      BRAND: ${{ inputs.brand_text }}
+      SALT: ${{ inputs.unique_salt }}
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 🟢 Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: kit/remotion/package.json
+
+      - name: 🔧 Install system + Python deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg fonts-dejavu-core fonts-liberation \
+            libnss3 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 libgbm-dev libasound2t64 \
+            libxrandr2 libxkbcommon-dev libxfixes3 libxcomposite1 libxdamage1 libcups2
+          python3 -m pip install --upgrade pip
+          python3 -m pip install numpy pillow
+
+      - name: 📦 Install Remotion (React)
+        working-directory: kit/remotion
+        run: |
+          set -euo pipefail
+          npm install --no-audit --no-fund
+          npx remotion browser ensure
+
+      - name: 🔍 Validate input
+        run: |
+          set -euo pipefail
+          case "$VIDEO_NAME" in
+            ""|*/*|*..*) echo "::error::শুধু ফাইলের নাম দিন (যেমন Day01.mp4), পাথ নয়।"; exit 1;;
+          esac
+          [[ "$TARGET" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "::error::duration_sec সংখ্যা হতে হবে"; exit 1; }
+          [[ "$DAY_TEXT" =~ ^[A-Za-z0-9_-]{1,10}$ ]] || { echo "::error::day_number ভুল (১-১০ অক্ষর/সংখ্যা)"; exit 1; }
+          SRC="video/$VIDEO_NAME"
+          if [ ! -f "$SRC" ]; then
+            for ext in mp4 mov mkv webm m4v; do
+              [ -f "video/$VIDEO_NAME.$ext" ] && SRC="video/$VIDEO_NAME.$ext" && break
+            done
+          fi
+          if [ ! -f "$SRC" ]; then
+            echo "::error::video/ এ '$VIDEO_NAME' পাওয়া যায়নি। আছে:"; ls -la video/ || true; exit 1
+          fi
+          echo "SRC=$SRC" >> "$GITHUB_ENV"
+
+      - name: 🎬 Python → Remotion render
+        run: |
+          set -euo pipefail
+          python3 -I kit/uniquify.py \
+            --src "$SRC" \
+            --day "$DAY_TEXT" \
+            --duration "$TARGET" \
+            --resolution "$RESOLUTION" \
+            --quality "$QUALITY" \
+            --audio "$AUDIO_MODE" \
+            --brand "$BRAND" \
+            --salt "$SALT" \
+            --out output
+
+      - name: 🧾 Show report
+        run: |
+          set -euo pipefail
+          cat output/report.json
+          ls -lh output/
+
+      - name: ⬆️ Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unique-video-${{ inputs.day_number }}
+          path: |
+            output/*.mp4
+            output/*.jpg
+            output/report.json
+            output/props.json
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: 🚀 Publish GitHub Release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="uvk-day${DAY_TEXT}-${GITHUB_RUN_ID}"
+          gh release create "$TAG" output/*.mp4 output/*.jpg output/report.json \
+            --title "Day ${DAY_TEXT} — unique build" --notes "Run #${GITHUB_RUN_NUMBER}"
